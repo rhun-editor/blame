@@ -3,6 +3,8 @@
 use rhun_ext::scm::is_uncommitted;
 use rhun_ext::{BlameCommit, LogEntry};
 
+use crate::git_info::CommitDetails;
+
 /// Git's empty tree: what a root commit's change is compared with.
 pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
@@ -89,6 +91,84 @@ pub fn hover_text(c: &BlameCommit, now: u64) -> String {
     }
 }
 
+/// The enhanced hover card of a line's commit with full message, author date, PR and web links.
+pub fn enhanced_hover_text(c: &BlameCommit, now: u64, details: Option<&CommitDetails>) -> String {
+    if is_uncommitted(&c.sha) {
+        return "Not committed yet: the line changed since the last commit (or is not saved)."
+            .into();
+    }
+
+    let Some(d) = details else {
+        return hover_text(c, now);
+    };
+
+    let author_name = if !d.author_name.is_empty() {
+        &d.author_name
+    } else {
+        &c.author
+    };
+    let author_email = if !d.author_email.is_empty() {
+        &d.author_email
+    } else {
+        &c.mail
+    };
+    let mail = if author_email.is_empty() {
+        String::new()
+    } else {
+        format!(" <{author_email}>")
+    };
+
+    let mut card = format!("{author_name}{mail}  \n");
+
+    let date_str = if !d.author_date.is_empty() {
+        format!("{} ({})", d.author_date, ago(now, c.time))
+    } else {
+        format!("{} ({})", date(c.time), ago(now, c.time))
+    };
+    card.push_str(&format!("Date:   {date_str}  \n"));
+
+    let short = &c.sha[..c.sha.len().min(8)];
+    if let Some(url) = &d.commit_url {
+        card.push_str(&format!("Commit: [{short}]({url})  \n"));
+    } else {
+        card.push_str(&format!("Commit: {short}  \n"));
+    }
+
+    if let Some(pr_num) = d.pr_number {
+        if let Some(url) = &d.pr_url {
+            card.push_str(&format!("PR:     [#{pr_num}]({url})  \n"));
+        } else {
+            card.push_str(&format!("PR:     #{pr_num}  \n"));
+        }
+    }
+
+    card.push('\n');
+
+    let summary = if !d.summary.is_empty() {
+        &d.summary
+    } else {
+        &c.summary
+    };
+    card.push_str(summary);
+    card.push('\n');
+
+    if !d.body.is_empty() {
+        card.push('\n');
+        let lines: Vec<&str> = d.body.lines().take(15).collect();
+        card.push_str(&lines.join("\n"));
+        if d.body.lines().count() > 15 {
+            card.push_str("\n…");
+        }
+        card.push('\n');
+    }
+
+    if card.len() > 3900 {
+        one_line(&card, 3900)
+    } else {
+        card.trim_end().to_string()
+    }
+}
+
 /// A row of a history list: "1a2b3c4  3 days ago  Ada Lovelace: Fix the parser".
 pub fn history_item(e: &LogEntry, now: u64) -> String {
     let short = &e.sha[..e.sha.len().min(7)];
@@ -151,7 +231,7 @@ mod tests {
         assert_eq!(after_text(&z, now), "    You, not committed yet");
         let long = BlameCommit {
             summary: "é".repeat(200),
-            ..c
+            ..c.clone()
         };
         let a = after_text(&long, now);
         assert!(a.len() <= 200 && a.ends_with('…'), "{a}");
@@ -163,6 +243,28 @@ mod tests {
             subject: "First".into(),
         };
         assert_eq!(history_item(&e, now), "bbbbbbb  3 days ago  Ada: First");
+
+        let details = CommitDetails {
+            sha: "a".repeat(40),
+            author_name: "Ada Lovelace".into(),
+            author_email: "ada@example.invalid".into(),
+            author_date: "2023-11-14 10:00:00 +0000".into(),
+            summary: "Fix the parser".into(),
+            body: "Resolves a critical edge case.\nSee issue description.".into(),
+            pr_number: Some(42),
+            pr_title: Some("Fix parser (#42)".into()),
+            commit_url: Some("https://github.com/rhun-editor/blame/commit/aaaaaaaa".into()),
+            pr_url: Some("https://github.com/rhun-editor/blame/pull/42".into()),
+        };
+        let eh = enhanced_hover_text(&c, now, Some(&details));
+        assert!(eh.contains("Ada Lovelace <ada@example.invalid>"));
+        assert!(eh.contains("Date:   2023-11-14 10:00:00 +0000 (3 days ago)"));
+        assert!(
+            eh.contains("Commit: [aaaaaaaa](https://github.com/rhun-editor/blame/commit/aaaaaaaa)")
+        );
+        assert!(eh.contains("PR:     [#42](https://github.com/rhun-editor/blame/pull/42)"));
+        assert!(eh.contains("Fix the parser"));
+        assert!(eh.contains("Resolves a critical edge case."));
     }
 
     #[test]

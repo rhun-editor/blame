@@ -13,9 +13,18 @@ print-present deco
 # the blame text is drawn after line 2's text: a point well right of "TWO" is in it
 print-xy 2 4
 print-hit 300 107
-move 70 86
+# hovering on code must NOT show the blame hovercard
+move 70 107
 wait 1500
-print-tip
+print-hover-card
+# hovering in blank space past the blame text must NOT show the hovercard
+move 600 107
+wait 1500
+print-hover-card
+# hovering on the inline blame text DOES show the hovercard
+move 300 107
+wait 1500
+print-hover-card
 key End
 type !
 wait 1500

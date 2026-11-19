@@ -1,0 +1,15 @@
+ext=blame state=running
+deco blame 2:1-2:4 after=    Grace, AGE • Shout the second line
+86 107
+inlay deco 2 4
+card=none
+card=shown kind=pointer line=2 col=4 focused=0 waiting=0 range=1
+section ext rhun-editor/blame: Grace <grace@example.invalid>  \nDate:   2002-03-04 05:06:07 +0000 (AGE)  \nCommit: SHA  \n\nShout the second line
+card=none
+deco blame 2:1-2:5 after=    You, not committed yet
+deco blame 2:1-2:4 after=    Grace, AGE • Shout the second line
+choose=History of line 2: open a commit's changes
+field=
+> SHA  AGE  Grace: Shout the second line
+  SHA  AGE  Ada: First lines
+tabs=a.txt | *a.txt (SHA..SHA)

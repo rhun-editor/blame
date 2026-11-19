@@ -8,6 +8,7 @@
 //! The protocol's handler forwards events to a worker thread that owns the state and talks to
 //! rhun, so typing never waits for git and blame requests are coalesced while the text changes.
 
+mod git_info;
 mod text;
 
 use std::collections::HashMap;
@@ -15,10 +16,14 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use git_info::{get_remote_url, resolve_commit_details, CommitDetails};
 use rhun_ext::scm::{is_git_changed, is_uncommitted};
-use rhun_ext::{run, Blame, Doc, Event, Ext, Feature, Handler, LogEntry, LogOf, Opened, Pos};
+use rhun_ext::{
+    run, Blame, Doc, Event, Ext, Feature, Handler, Hover, HoverRequest, LogEntry, LogOf, Opened,
+    Pos, Range,
+};
 
-use text::{after_text, ago, history_item, hover_text, line_lengths, EMPTY_TREE};
+use text::{after_text, ago, enhanced_hover_text, history_item, line_lengths, EMPTY_TREE};
 
 /// What the handler tells the worker.
 enum Msg {
@@ -28,6 +33,7 @@ enum Msg {
     Cursor(Doc, u32),
     Selection(Doc, u32, u32),
     Hover(Doc, u32, u32),
+    HoverQuery(HoverRequest, Sender<Option<Hover>>),
     Command(String, Doc),
     Inline(bool),
     GitChanged,
@@ -86,6 +92,12 @@ impl Handler for Blamer {
         self.send(Msg::Command(name.to_string(), doc));
     }
 
+    fn hover(&mut self, _ext: &Ext, req: &HoverRequest) -> Option<Hover> {
+        let (tx, rx) = channel();
+        self.send(Msg::HoverQuery(req.clone(), tx));
+        rx.recv_timeout(Duration::from_millis(1000)).ok().flatten()
+    }
+
     fn setting(&mut self, _ext: &Ext, key: &str, value: &str) {
         if key == "inline" {
             // a bool setting arrives as yes or no
@@ -128,6 +140,9 @@ struct Worker {
     typed: bool,
     /// rhun agreed decorations and took the type.
     decorations: bool,
+    repo_root: Option<String>,
+    remote_url: Option<String>,
+    commit_cache: HashMap<String, CommitDetails>,
 }
 
 const SETTLE: Duration = Duration::from_millis(500);
@@ -150,6 +165,9 @@ impl Worker {
             shown: None,
             typed: false,
             decorations: false,
+            repo_root: None,
+            remote_url: None,
+            commit_cache: HashMap::new(),
         }
     }
 
@@ -225,6 +243,10 @@ impl Worker {
                 }
             }
             Msg::Hover(doc, line, col) => self.hover(doc, line, col),
+            Msg::HoverQuery(req, tx) => {
+                let hover = self.handle_hover_query(&req);
+                let _ = tx.send(hover);
+            }
             Msg::Command(name, doc) => self.command(&name, doc),
             Msg::Inline(on) => {
                 self.inline = on;
@@ -236,6 +258,9 @@ impl Worker {
                     d.error = None;
                     d.blame_version = 0;
                 }
+                self.repo_root = None;
+                self.remote_url = None;
+                self.commit_cache.clear();
                 self.show_cursor();
             }
         }
@@ -343,17 +368,89 @@ impl Worker {
         let _ = self.ext.status("");
     }
 
+    fn ensure_repo(&mut self) {
+        if self.repo_root.is_none() {
+            if let Ok(repo) = self.ext.git_repo() {
+                self.remote_url = get_remote_url(&repo.root);
+                self.repo_root = Some(repo.root);
+            }
+        }
+    }
+
+    fn get_commit_details(&mut self, sha: &str) -> Option<CommitDetails> {
+        if is_uncommitted(sha) {
+            return None;
+        }
+        if let Some(cached) = self.commit_cache.get(sha) {
+            return Some(cached.clone());
+        }
+        let root = self.repo_root.as_ref()?;
+        let details = resolve_commit_details(root, sha, self.remote_url.as_deref());
+        self.commit_cache.insert(sha.to_string(), details.clone());
+        Some(details)
+    }
+
     fn hover(&mut self, doc: Doc, line: u32, col: u32) {
         if !self.docs.contains_key(&doc) {
             return;
         }
         self.ensure(doc);
-        let d = &self.docs[&doc];
-        if let Some(c) = d.blame.as_ref().and_then(|b| b.line(line)) {
-            let _ = self
-                .ext
-                .hover(doc, Pos::new(line, col), &hover_text(c, now_secs()));
+        self.ensure_repo();
+        let commit = self
+            .docs
+            .get(&doc)
+            .and_then(|d| d.blame.as_ref())
+            .and_then(|b| b.line(line))
+            .cloned();
+        if let Some(c) = commit {
+            let details = self.get_commit_details(&c.sha);
+            let text = enhanced_hover_text(&c, now_secs(), details.as_ref());
+            let _ = self.ext.hover(doc, Pos::new(line, col), &text);
         }
+    }
+
+    fn handle_hover_query(&mut self, req: &HoverRequest) -> Option<Hover> {
+        if !self.inline {
+            return None;
+        }
+        if !self.docs.contains_key(&req.doc) {
+            return None;
+        }
+        // Only show if the hover is on the active document and line where inline blame is shown
+        let (cursor_doc, cursor_line) = self.cursor?;
+        if req.doc != cursor_doc || req.at.line != cursor_line {
+            return None;
+        }
+        let len = self
+            .docs
+            .get(&req.doc)
+            .and_then(|d| d.lens.get((req.at.line as usize).wrapping_sub(1)).copied())
+            .unwrap_or(0);
+        // Only show if hovering past the code text on that line (i.e. on the blame annotation)
+        if req.at.col <= len as u32 {
+            return None;
+        }
+        self.ensure(req.doc);
+        self.ensure_repo();
+        let commit = self
+            .docs
+            .get(&req.doc)
+            .and_then(|d| d.blame.as_ref())
+            .and_then(|b| b.line(req.at.line))
+            .cloned()?;
+        let details = self.get_commit_details(&commit.sha);
+        let text = enhanced_hover_text(&commit, now_secs(), details.as_ref());
+        let end = if let Some(d) = self.docs.get(&req.doc) {
+            if (req.at.line as usize) < d.lens.len() {
+                Pos::new(req.at.line + 1, 1)
+            } else {
+                Pos::new(req.at.line, (len + 1) as u32)
+            }
+        } else {
+            Pos::new(req.at.line, (len + 1) as u32)
+        };
+        let range = Range::new(Pos::new(req.at.line, (len + 1) as u32), end);
+        Some(Hover::new(range, &text))
     }
 
     fn command(&mut self, name: &str, doc: Doc) {
@@ -471,7 +568,12 @@ impl Worker {
 }
 
 fn main() {
-    let features = [Feature::GitData, Feature::Named("decorations")];
+    let features = [
+        Feature::GitData,
+        Feature::Named("decorations"),
+        Feature::HoverQuery,
+        Feature::Named("markdown"),
+    ];
     if let Err(e) = run(&features, Blamer { tx: None }) {
         eprintln!("blame: {e}");
         std::process::exit(1);
